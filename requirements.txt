@@ -1,0 +1,6 @@
+streamlit
+mcp>=2
+skyfield
+fastembed
+chromadb
+numpy

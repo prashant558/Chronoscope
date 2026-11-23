@@ -1,3 +1,4 @@
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))  # repo root
 """One raw REST call to Gemini, no SDK. Tells us: service problem or SDK problem."""
 import os, sys, json, time, urllib.request, urllib.error
 sys.path.insert(0, "."); import llm  # only for .env loading

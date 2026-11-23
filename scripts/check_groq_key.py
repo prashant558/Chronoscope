@@ -1,3 +1,4 @@
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))  # repo root
 """Find out which GROQ_API_KEY is used and why Groq rejects it. Never prints the full key."""
 import os, json, urllib.request, urllib.error
 

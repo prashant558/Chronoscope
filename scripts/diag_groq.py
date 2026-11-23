@@ -1,3 +1,4 @@
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))  # repo root
 """One raw call to Groq (OpenAI-compatible). Tests key, speed, and tool calling."""
 import os, sys, json, time, urllib.request, urllib.error
 sys.path.insert(0, "."); import llm   # loads .env
