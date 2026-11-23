@@ -113,12 +113,37 @@ class Agent:
     async def __aexit__(self, *exc):
         await self.stack.aclose()
 
+    def _coerce(self, fn, args):
+        """Fix common small-model mistakes: wrong types for arguments."""
+        schema = next((t["function"]["parameters"] for t in self.tools
+                       if t["function"]["name"] == fn), {})
+        props = schema.get("properties", {})
+        fixed = {}
+        for k, v in args.items():
+            types = {props.get(k, {}).get("type")} | {x.get("type") for x in props.get(k, {}).get("anyOf", [])}
+            try:
+                if "string" in types and not isinstance(v, str): v = str(v)
+                elif "integer" in types and isinstance(v, str): v = int(v)
+                elif "number" in types and isinstance(v, str): v = float(v)
+            except ValueError:
+                pass
+            fixed[k] = v
+        return fixed
+
     async def call_tool(self, name, args):
         if name not in self.route:
             return json.dumps({"error": f"Unknown tool '{name}'"})
         try:
             res = await self.route[name][1].call_tool(name, args)
-            return "".join(getattr(c, "text", "") for c in res.content)
+            sc = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
+            if sc is not None:
+                if isinstance(sc, dict) and set(sc) == {"result"}:   # MCP wraps non-dict returns
+                    sc = sc["result"]
+                return json.dumps(sc, ensure_ascii=False)
+            texts = [getattr(c, "text", "") for c in res.content]
+            if len(texts) > 1:                                        # list returned as many blocks
+                return json.dumps(texts, ensure_ascii=False)
+            return texts[0] if texts else ""
         except Exception as e:
             return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
@@ -141,6 +166,7 @@ class Agent:
                     args = json.loads(c["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
+                args = self._coerce(fn, args)
                 key = (fn, json.dumps(args, sort_keys=True))
                 t, cached = time.time(), key in memo
                 out = memo[key] if cached else await self.call_tool(fn, args)
