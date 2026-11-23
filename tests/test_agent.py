@@ -12,7 +12,7 @@ async def main():
     used = {t["tool"] for t in out["trace"]}
     servers = {t["server"] for t in out["trace"]}
     print(f"   tools used: {sorted(used)}")
-    assert {"sky", "history", "news"} <= servers, f"Not all servers used: {servers}"
+    assert {"sky", "history", "news", "knowledge"} <= servers, f"Not all servers used: {servers}"
     print("✅ Agent used all three servers")
     ans = out["answer"].lower()
     assert "###" in out["answer"] and len(out["answer"]) > 300, "Capsule too short / wrong format"

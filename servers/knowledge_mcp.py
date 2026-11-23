@@ -20,6 +20,10 @@ _embedder = None
 def _embed(texts, query=False):
     global _embedder
     if _embedder is None:
+        try:
+            import onnxruntime; onnxruntime.set_default_logger_severity(3)
+        except Exception:
+            pass
         from fastembed import TextEmbedding
         _embedder = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=str(DATA / "models"))
     fn = _embedder.query_embed if query else _embedder.passage_embed
