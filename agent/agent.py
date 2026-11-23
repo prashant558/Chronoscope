@@ -13,6 +13,7 @@ SERVERS = {   # name: (script, env vars it needs). Least privilege.
     "sky":     ("servers/sky_mcp.py", []),
     "history": ("servers/history_mcp.py", []),
     "news":    ("servers/news_mcp.py", ["NYT_API_KEY"]),
+    "knowledge": ("servers/knowledge_mcp.py", []),
 }
 MAX_STEPS = 5
 MAX_TOOL_CHARS = 1800
@@ -23,7 +24,8 @@ SYSTEM = """You are Chronoscope, a time-travel research agent. The user gives a 
 Plan (be efficient, at most 3 rounds of tool calls):
 1. Call events_on_date AND headlines_on_date in the SAME reply (date as YYYY-MM-DD).
 2. Call sky_on_date for the place of the main event (use the nearest known city below, or lat/lon/timezone)
-   AND article_summary for the main event's Wikipedia article, in the SAME reply.
+   AND research(topic=<main event's Wikipedia article title>, question='What happened and why did it matter?'),
+   in the SAME reply.
 3. Write the capsule. Never call the same tool twice with the same arguments.
 
 Known cities for sky_on_date: {cities}
@@ -31,13 +33,14 @@ Known cities for sky_on_date: {cities}
 Capsule format (Markdown, under 350 words):
 ## 🗓️ <date>: <short title>
 ### What happened
+2-4 sentences. EVERY sentence ends with the [ref] number of the research passage that supports it.
 ### In the newspapers
 2-4 headlines about the main event, copied EXACTLY from headlines_on_date, in “quotes”. Mark front_page ones with 📰.
 Optionally one line 'Also in the news:' with one unrelated front-page headline, also copied exactly.
 ### The sky that night
 place, local time, darkness, moon phase, visible planets with direction
 ### Why it mattered
-2-3 sentences
+2-3 sentences, each ending with its [ref]. Do NOT write a Sources section; it is added automatically
 
 STRICT RULES:
 - Use ONLY facts that appear in tool results. Do NOT add details from your own memory
@@ -81,6 +84,24 @@ def verify_headlines(answer, known):
     return "\n".join(out), removed
 
 
+def attach_sources(answer, sources):
+    """Drop citations that don't exist, then append a Sources list built from real passages."""
+    answer = re.split(r"\n#+\s*Sources", answer)[0].rstrip()
+    valid = {s["ref"] for s in sources}
+    used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer)})
+    for n in used:
+        if n not in valid:
+            answer = answer.replace(f"[{n}]", "")
+    cited = [s for s in sources if s["ref"] in used and s["ref"] in valid]
+    if cited:
+        def link(s):
+            sec = s["section"] or ""
+            return s["url"] + ("" if sec in ("", "Introduction") else "#" + sec.replace(" ", "_"))
+        answer += "\n\n### Sources\n" + "\n".join(
+            f"[{s['ref']}] {s['article']}, {s['section']}: {link(s)}" for s in cited)
+    return answer
+
+
 class Agent:
     def __init__(self):
         self.stack, self.tools, self.route, self.cities = AsyncExitStack(), [], {}, []
@@ -112,6 +133,25 @@ class Agent:
 
     async def __aexit__(self, *exc):
         await self.stack.aclose()
+
+    @staticmethod
+    def _register_sources(out, sources):
+        """Give every retrieved passage a global [ref] number; the LLM only ever sees these refs."""
+        try:
+            data = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            return out[:MAX_TOOL_CHARS]
+        if "error" in data:
+            return json.dumps(data)
+        passages = []
+        for p in data.get("passages", []):
+            hit = next((s for s in sources if s["article"] == data.get("article") and s["text"] == p["text"]), None)
+            if not hit:
+                hit = {"ref": len(sources) + 1, "article": data.get("article"), "section": p.get("section"),
+                       "url": data.get("url"), "text": p["text"]}
+                sources.append(hit)
+            passages.append({"ref": hit["ref"], "section": p.get("section"), "text": p["text"][:700]})
+        return json.dumps({"article": data.get("article"), "passages": passages}, ensure_ascii=False)
 
     def _coerce(self, fn, args):
         """Fix common small-model mistakes: wrong types for arguments."""
@@ -150,7 +190,7 @@ class Agent:
     async def run(self, question, verbose=True):
         system = SYSTEM.format(cities=", ".join(self.cities) if self.cities else "(unknown, use lat/lon)")
         messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
-        trace, memo, headlines, t0 = [], {}, [], time.time()
+        trace, memo, headlines, sources, t0 = [], {}, [], [], time.time()
         who = "?"
 
         for step in range(1, MAX_STEPS + 1):
@@ -182,7 +222,7 @@ class Agent:
                 if verbose:
                     print(f"🔧 step {step}: {server}.{fn}({json.dumps(args)})"
                           + (" → reused earlier result" if cached else f" → {len(out)} chars, {time.time()-t:.1f}s"))
-                content = _compact(out)
+                content = self._register_sources(out, sources) if fn == "research" else _compact(out)
                 if cached:
                     content = "(Already called with these arguments; same result.) " + content
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": content})
@@ -192,10 +232,11 @@ class Agent:
             answer = msg.get("content") or ""
 
         answer, removed = verify_headlines(answer, headlines)
+        answer = attach_sources(answer, sources)
         if verbose and removed:
             print(f"🛡️  Guard removed {len(removed)} unverified headline line(s):")
             for r in removed: print(f"     ✂ {r[:100]}")
-        return {"answer": answer, "trace": trace, "model": who, "removed_headlines": removed,
+        return {"answer": answer, "trace": trace, "model": who, "removed_headlines": removed, "sources": sources,
                 "seconds": round(time.time() - t0, 1)}
 
 
