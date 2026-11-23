@@ -197,14 +197,17 @@ class Agent:
             passages.append({"ref": hit["ref"], "section": p.get("section"), "text": p["text"][:700]})
         return json.dumps({"article": data.get("article"), "passages": passages}, ensure_ascii=False)
 
-    async def run(self, question, verbose=True):
+    async def run(self, question, verbose=True, on_event=None):
+        emit = on_event or (lambda e: None)          # UI hook for live progress
         system = SYSTEM.format(cities=", ".join(self.cities) if self.cities else "(unknown, use lat/lon)")
         messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
         trace, memo, headlines, sources, t0, who = [], {}, [], [], time.time(), "?"
         answer, nudges = "", 0
 
         for step in range(1, MAX_STEPS + 1):
+            emit({"type": "thinking", "step": step})
             who, msg = await asyncio.to_thread(llm.chat, messages, self.tools, verbose)
+            emit({"type": "model", "step": step, "model": who})
             calls = msg.get("tool_calls") or []
             if not calls:
                 answer = (msg.get("content") or "").strip()
@@ -244,6 +247,7 @@ class Agent:
                 server = self.route.get(fn, ("?",))[0]
                 trace.append({"step": step, "server": server, "tool": fn, "args": args, "cached": cached,
                               "seconds": round(time.time() - t, 2), "error": '"error"' in out[:200]})
+                emit({"type": "tool", **trace[-1]})
                 if verbose:
                     print(f"🔧 step {step}: {server}.{fn}({json.dumps(args)})"
                           + (" → reused earlier result" if cached else f" → {len(out)} chars, {time.time()-t:.1f}s"))
