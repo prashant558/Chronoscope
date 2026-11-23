@@ -1,5 +1,5 @@
-"""Chronoscope agent: connects to MCP servers, lets the LLM pick tools, writes a time capsule."""
-import asyncio, json, os, sys, time
+"""Chronoscope agent: connects to MCP servers, lets the LLM pick tools, writes a verified time capsule."""
+import asyncio, json, os, re, sys, time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -9,42 +9,81 @@ import llm
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client, get_default_environment
 
-# server name: (script, env vars it needs). Least privilege: each server gets only its own keys.
-SERVERS = {
+SERVERS = {   # name: (script, env vars it needs). Least privilege.
     "sky":     ("servers/sky_mcp.py", []),
     "history": ("servers/history_mcp.py", []),
     "news":    ("servers/news_mcp.py", ["NYT_API_KEY"]),
 }
-MAX_STEPS = 8
-MAX_TOOL_CHARS = 2000      # keep prompts small: Groq free tier has a tokens-per-minute limit
+MAX_STEPS = 5
+MAX_TOOL_CHARS = 1800
+HIDDEN_FROM_LLM = {"list_cities"}       # called once at startup instead
 
 SYSTEM = """You are Chronoscope, a time-travel research agent. The user gives a date (any format) and maybe a place.
 
-Plan:
-1. FIRST reply: call events_on_date AND headlines_on_date together (date as YYYY-MM-DD).
-2. SECOND reply: pick the city where the main event happened (call list_cities if unsure; nearest listed city is fine,
-   or pass lat/lon/timezone) and call sky_on_date for that evening, or the event time if known.
-   Also call article_summary for the main event's Wikipedia article.
-3. Then write the capsule. No more tool calls.
+Plan (be efficient, at most 3 rounds of tool calls):
+1. Call events_on_date AND headlines_on_date in the SAME reply (date as YYYY-MM-DD).
+2. Call sky_on_date for the place of the main event (use the nearest known city below, or lat/lon/timezone)
+   AND article_summary for the main event's Wikipedia article, in the SAME reply.
+3. Write the capsule. Never call the same tool twice with the same arguments.
+
+Known cities for sky_on_date: {cities}
 
 Capsule format (Markdown, under 350 words):
 ## 🗓️ <date>: <short title>
 ### What happened
 ### In the newspapers
-2-4 REAL headlines about the main event, quoted exactly from the tool result, mark front-page ones with 📰.
-Optionally one line 'Also in the news:' with one unrelated front-page headline.
+2-4 headlines about the main event, copied EXACTLY from headlines_on_date, in “quotes”. Mark front_page ones with 📰.
+Optionally one line 'Also in the news:' with one unrelated front-page headline, also copied exactly.
 ### The sky that night
 place, local time, darkness, moon phase, visible planets with direction
 ### Why it mattered
 2-3 sentences
 
-Rules: use ONLY facts from tool results. Never invent headlines or events. If a tool returns an error,
-say that section is unavailable. Sky data exists only for 1900-2050; newspapers only from Sept 1851."""
+STRICT RULES:
+- Use ONLY facts that appear in tool results. Do NOT add details from your own memory
+  (places, numbers, outcomes), even if you are sure they are true.
+- Never write a headline that is not in the headlines_on_date result.
+- If a tool returned an error or nothing relevant, say so briefly.
+- Sky data exists only for 1900-2050; newspapers only from Sept 1851."""
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9 ]", "", s.lower().replace("‘", "'").replace("’", "'"))
+
+def _compact(text):
+    """Shrink tool output for the LLM: drop URLs/source, trim long strings."""
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text[:MAX_TOOL_CHARS]
+    def walk(o):
+        if isinstance(o, dict):
+            return {k: walk(v) for k, v in o.items() if k not in ("url", "source")}
+        if isinstance(o, list):
+            return [walk(x) for x in o]
+        if isinstance(o, str) and len(o) > 220:
+            return o[:220] + "…"
+        return o
+    return json.dumps(walk(obj), ensure_ascii=False, separators=(",", ":"))[:MAX_TOOL_CHARS]
+
+def verify_headlines(answer, known):
+    """Remove any quoted headline in the newspaper section that isn't in the real NYT data."""
+    known_n = [_norm(h) for h in known]
+    out, removed, in_news = [], [], False
+    for line in answer.split("\n"):
+        if line.startswith("###"):
+            in_news = "newspaper" in line.lower()
+        quotes = re.findall(r"[“\"]([^”\"]{8,})[”\"]", line) if in_news else []
+        if quotes and not all(any(_norm(q)[:40] in k for k in known_n) for q in quotes):
+            removed.append(line.strip())
+            continue
+        out.append(line)
+    return "\n".join(out), removed
 
 
 class Agent:
     def __init__(self):
-        self.stack, self.tools, self.route = AsyncExitStack(), [], {}
+        self.stack, self.tools, self.route, self.cities = AsyncExitStack(), [], {}, []
 
     async def __aenter__(self):
         for name, (script, keys) in SERVERS.items():
@@ -57,11 +96,18 @@ class Agent:
             session = await self.stack.enter_async_context(ClientSession(r, w))
             await session.initialize()
             for t in (await session.list_tools()).tools:          # discover tools, don't hard-code
+                self.route[t.name] = (name, session)
+                if t.name in HIDDEN_FROM_LLM:
+                    continue
                 schema = (getattr(t, "input_schema", None) or getattr(t, "inputSchema", None)
                           or {"type": "object", "properties": {}})
                 self.tools.append({"type": "function", "function": {
-                    "name": t.name, "description": (t.description or "")[:600], "parameters": schema}})
-                self.route[t.name] = (name, session)
+                    "name": t.name, "description": (t.description or "")[:500], "parameters": schema}})
+        if "list_cities" in self.route:                            # one call at startup, not per run
+            try:
+                self.cities = json.loads(await self.call_tool("list_cities", {}))
+            except Exception:
+                self.cities = []
         return self
 
     async def __aexit__(self, *exc):
@@ -70,22 +116,24 @@ class Agent:
     async def call_tool(self, name, args):
         if name not in self.route:
             return json.dumps({"error": f"Unknown tool '{name}'"})
-        _, session = self.route[name]
         try:
-            res = await session.call_tool(name, args)
+            res = await self.route[name][1].call_tool(name, args)
             return "".join(getattr(c, "text", "") for c in res.content)
         except Exception as e:
             return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
     async def run(self, question, verbose=True):
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
-        trace, t0 = [], time.time()
+        system = SYSTEM.format(cities=", ".join(self.cities) if self.cities else "(unknown, use lat/lon)")
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
+        trace, memo, headlines, t0 = [], {}, [], time.time()
+        who = "?"
+
         for step in range(1, MAX_STEPS + 1):
             who, msg = await asyncio.to_thread(llm.chat, messages, self.tools, verbose)
             calls = msg.get("tool_calls") or []
-            if not calls:                                         # LLM is done → final answer
-                return {"answer": msg.get("content") or "", "trace": trace,
-                        "model": who, "seconds": round(time.time() - t0, 1)}
+            if not calls:
+                answer = msg.get("content") or ""
+                break
             messages.append({"role": "assistant", "content": msg.get("content"), "tool_calls": calls})
             for c in calls:
                 fn = c["function"]["name"]
@@ -93,30 +141,46 @@ class Agent:
                     args = json.loads(c["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                t = time.time()
-                out = await self.call_tool(fn, args)
+                key = (fn, json.dumps(args, sort_keys=True))
+                t, cached = time.time(), key in memo
+                out = memo[key] if cached else await self.call_tool(fn, args)
+                memo[key] = out
+                if fn == "headlines_on_date":
+                    try:
+                        headlines += [h["headline"] for h in json.loads(out).get("headlines", [])]
+                    except Exception:
+                        pass
                 server = self.route.get(fn, ("?",))[0]
-                trace.append({"step": step, "server": server, "tool": fn, "args": args,
-                              "seconds": round(time.time() - t, 2), "chars": len(out),
-                              "error": '"error"' in out[:200]})
+                trace.append({"step": step, "server": server, "tool": fn, "args": args, "cached": cached,
+                              "seconds": round(time.time() - t, 2), "error": '"error"' in out[:200]})
                 if verbose:
-                    print(f"🔧 step {step}: {server}.{fn}({json.dumps(args)}) → {len(out)} chars, "
-                          f"{time.time()-t:.1f}s")
-                messages.append({"role": "tool", "tool_call_id": c["id"], "content": out[:MAX_TOOL_CHARS]})
-        # Step limit reached: force a final answer without tools
-        messages.append({"role": "user", "content": "Write the final capsule now with what you have."})
-        who, msg = await asyncio.to_thread(llm.chat, messages, None, verbose)
-        return {"answer": msg.get("content") or "", "trace": trace,
-                "model": who, "seconds": round(time.time() - t0, 1)}
+                    print(f"🔧 step {step}: {server}.{fn}({json.dumps(args)})"
+                          + (" → reused earlier result" if cached else f" → {len(out)} chars, {time.time()-t:.1f}s"))
+                content = _compact(out)
+                if cached:
+                    content = "(Already called with these arguments; same result.) " + content
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": content})
+        else:
+            messages.append({"role": "user", "content": "Write the final capsule now. No more tool calls."})
+            who, msg = await asyncio.to_thread(llm.chat, messages, None, verbose)
+            answer = msg.get("content") or ""
+
+        answer, removed = verify_headlines(answer, headlines)
+        if verbose and removed:
+            print(f"🛡️  Guard removed {len(removed)} unverified headline line(s):")
+            for r in removed: print(f"     ✂ {r[:100]}")
+        return {"answer": answer, "trace": trace, "model": who, "removed_headlines": removed,
+                "seconds": round(time.time() - t0, 1)}
 
 
 async def main():
     question = " ".join(sys.argv[1:]) or "9 November 1989"
     async with Agent() as agent:
-        print(f"🔌 Connected. Tools discovered: {', '.join(sorted(agent.route))}\n")
+        print(f"🔌 Connected. Tools: {', '.join(sorted(agent.route))} · {len(agent.cities)} cities\n")
         out = await agent.run(question)
     print("\n" + "═" * 60 + "\n" + out["answer"] + "\n" + "═" * 60)
-    print(f"{len(out['trace'])} tool calls · {out['seconds']}s · written by {out['model']}")
+    print(f"{len(out['trace'])} tool calls · {out['seconds']}s · written by {out['model']}"
+          + (f" · 🛡️ {len(out['removed_headlines'])} headline(s) removed" if out["removed_headlines"] else ""))
 
 if __name__ == "__main__":
     asyncio.run(main())
