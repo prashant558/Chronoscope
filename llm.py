@@ -1,76 +1,61 @@
-"""Shared Gemini helper: newest model first, timeouts, visible retries, fallback."""
-import os, re, time
-from google import genai
-from google.genai import types
+"""One LLM helper, many free providers (all OpenAI-compatible). Falls back automatically."""
+import json, os, time, urllib.request, urllib.error
+from pathlib import Path
 
-TIMEOUT_S = 60          # max wait per request
-MAX_TOTAL_S = 240       # give up entirely after this
-
-RETRYABLE = ("500", "503", "504", "429", "unavailable", "deadline",
-             "resource_exhausted", "timeout", "timed out", "internal")
-
-def _load_env(path=".env"):
-    if os.path.exists(path):
-        for line in open(path):
+ROOT = Path(__file__).resolve().parent
+def _load_env():
+    """Load non-secret settings (e.g. GEMINI_MODEL) from .env. Keys come only from Codespaces secrets."""
+    f = ROOT / ".env"
+    if f.exists():
+        for line in open(f):
             if "=" in line and not line.startswith("#"):
                 k, v = line.strip().split("=", 1)
-                os.environ.setdefault(k, v)
+                if not k.endswith(("_KEY", "_TOKEN", "_SECRET")):
+                    os.environ.setdefault(k, v)
 _load_env()
 
-_client = None
-def client():
-    global _client
-    if _client is None:
-        key = os.environ.get("GEMINI_API_KEY")
-        if not key:
-            raise RuntimeError("GEMINI_API_KEY not set")
-        opts = {"timeout": TIMEOUT_S * 1000}                 # milliseconds
-        try:                                                 # turn off SDK's silent retries
-            opts["retry_options"] = types.HttpRetryOptions(attempts=1)
-        except (AttributeError, TypeError):
-            pass                                             # older SDK: no retries anyway
-        _client = genai.Client(api_key=key, http_options=types.HttpOptions(**opts))
-    return _client
+# Order = priority. (name, base_url, env var holding the key, [models])
+PROVIDERS = [
+    ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY",
+     ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY",
+     [os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")]),
+    ("github", "https://models.github.ai/inference", "GITHUB_MODELS_TOKEN",
+     ["openai/gpt-4.1-mini"]),
+]
+TIMEOUT_S = 45
 
-def _version(n):
-    m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-    return float(m.group(1)) if m else 0.0
+def available():
+    return [(n, u, os.environ[k], ms) for n, u, k, ms in PROVIDERS if os.environ.get(k)]
 
-_models_cache = None
-def candidate_models():
-    global _models_cache
-    if _models_cache is None:
-        names = [m.name.replace("models/", "") for m in client().models.list()
-                 if "flash" in m.name and "generateContent" in (m.supported_actions or [])
-                 and not any(x in m.name for x in ("image", "tts", "live", "audio", "lite"))]
-        names.sort(key=lambda n: (_version(n), "preview" not in n), reverse=True)
-        saved = os.environ.get("GEMINI_MODEL")
-        if saved in names:
-            names.remove(saved); names.insert(0, saved)
-        _models_cache = names
-    return _models_cache
+def _post(url, key, body):
+    req = urllib.request.Request(f"{url}/chat/completions", json.dumps(body).encode(),
+          {"Content-Type": "application/json", "Authorization": f"Bearer {key}",
+           "User-Agent": "Chronoscope/0.1"})
+    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+        return json.load(r)
 
-def generate(prompt, retries=0, verbose=False):
-    """Return (model_used, text). Times out, retries busy models, falls back."""
-    start, last = time.time(), None
-    for model in candidate_models():
-        for attempt in range(retries + 1):
-            if time.time() - start > MAX_TOTAL_S:
-                raise RuntimeError(f"Gave up after {MAX_TOTAL_S}s. Last error: {last}")
-            if verbose: print(f"   → trying {model} (attempt {attempt + 1})", flush=True)
+def chat(messages, tools=None, verbose=False, temperature=0.3):
+    """Returns (provider/model, assistant_message). Message may contain 'tool_calls'."""
+    errors = []
+    for name, url, key, models in available():
+        for model in models:
+            body = {"model": model, "messages": messages, "temperature": temperature}
+            if tools: body["tools"] = tools
+            t = time.time()
             try:
-                r = client().models.generate_content(model=model, contents=prompt)
-                return model, r.text
+                out = _post(url, key, body)
+                if verbose: print(f"   ✓ {name}/{model} in {time.time()-t:.1f}s")
+                return f"{name}/{model}", out["choices"][0]["message"]
+            except urllib.error.HTTPError as e:
+                errors.append(f"{name}/{model}: HTTP {e.code}")
+                if verbose: print(f"   ✗ {name}/{model}: HTTP {e.code}, trying next")
             except Exception as e:
-                msg, last = str(e), e
-                if "404" in msg:
-                    if verbose: print(f"     retired, next model"); break
-                if "429" in msg or "resource_exhausted" in msg.lower():
-                    if verbose: print("     quota exhausted for this model, next model")
-                    break
-                if any(x in msg.lower() for x in RETRYABLE):
-                    wait = 3 * (attempt + 1)
-                    if verbose: print(f"     busy/timeout, waiting {wait}s")
-                    time.sleep(wait); continue
-                raise
-    raise RuntimeError(f"All Gemini models failed. Last error: {last}")
+                errors.append(f"{name}/{model}: {type(e).__name__}")
+                if verbose: print(f"   ✗ {name}/{model}: {type(e).__name__}, trying next")
+    raise RuntimeError("All LLM providers failed: " + "; ".join(errors or ["no API keys set"]))
+
+def generate(prompt, verbose=False):
+    """Simple text in, text out. Returns (provider/model, text)."""
+    who, msg = chat([{"role": "user", "content": prompt}], verbose=verbose)
+    return who, msg.get("content") or ""
